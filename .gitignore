@@ -106,3 +106,4 @@ venv.bak/
 out/
 .vscode/
 *sandbox.py
+*.pt

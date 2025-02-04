@@ -11,9 +11,9 @@ from optimisers.adamax import AdamaxOptimizer
 from tqdm import tqdm
 import traceback
 
-DTYPE = tf.float64
-DTYPE_INT = tf.int64
-NP_DTYPE = np.float64
+DTYPE = tf.float32
+DTYPE_INT = tf.int32
+NP_DTYPE = np.float32
 
 tfd = tf.contrib.distributions
 tfb = tfd.bijectors
@@ -49,13 +49,22 @@ class Bivariate_Normal():
 
     def __init__(self, mu, chol):
         self.mu = tf.expand_dims(mu, 2)
-        self.chol = chol + tf.expand_dims(tf.eye(2, dtype=DTYPE) * 1e-2, 0) # (p*(T-1), 2, 2)
-        self.det = tf.reduce_prod(tf.matrix_diag_part(self.chol), axis=1) ** 2
+        # self.chol = chol + tf.expand_dims(tf.eye(2, dtype=DTYPE) * 1e-2, 0) # (p*(T-1), 2, 2)
+        self.chol = chol
         cov_matrix = self.chol @ tf.transpose(self.chol, [0, 2, 1])
+        # eps = 1e-5
+        # cov_matrix = cov_matrix + tf.expand_dims(tf.eye(2, dtype=DTYPE) * eps, 0)
+        # # self.cov_inv = tf.linalg.inv(cov_matrix)
+        # s, u, v = tf.linalg.svd(cov_matrix)
+        # s_inv = 1.0 / s
+        # self.cov_inv = tf.matmul(v, tf.matmul(tf.linalg.diag(s_inv), tf.transpose(u, perm=[0, 2, 1])))
+        # self.det = tf.reduce_prod(tf.matrix_diag_part(self.chol)**2 + eps, axis=1)
 
         def compute_pseudo_inverse(cov_matrix):
             
             s, u, v = tf.linalg.svd(cov_matrix)
+            
+            eps = 1e-5
             
             method1 = False
             if method1:
@@ -63,13 +72,13 @@ class Bivariate_Normal():
                 cov_inv = tf.matmul(v, tf.matmul(tf.linalg.diag(s_inv), tf.transpose(u, perm=[0, 2, 1])))
             
             if not(method1):
-                s_update = s + 1e-3 * tf.ones((1,2), dtype=DTYPE)
+                s_update = s + eps * tf.ones((1,2), dtype=DTYPE)
                 s_inv = 1.0 / s_update
                 cov_inv = tf.matmul(v, tf.matmul(tf.linalg.diag(s_inv), tf.transpose(u, perm=[0, 2, 1])))
                 det = tf.reduce_prod(s_update, axis=1)
             return cov_inv, s_inv, det   
              
-        self.cov_inv, self.s_inv, self.det = compute_pseudo_inverse(cov_matrix)
+        self.cov_inv, s_inv, self.det = compute_pseudo_inverse(cov_matrix)
         
         # determinant_min = tf.reduce_min(tf.abs(self.det))
         # self.cov_inv = tf.cond(
@@ -685,8 +694,8 @@ try:
     batch_dims = 151 #length M of time series for partitioning the data
     network_dims = [50] * 5
     no_flows = 3 # number of flow layers
-    num_epochs = 1010
-    pre_train_epochs = 500
+    num_epochs = 2
+    pre_train_epochs = 1
     feat_window = 10 #l' obs window size
     print('\n'*3)
     # obs and theta
