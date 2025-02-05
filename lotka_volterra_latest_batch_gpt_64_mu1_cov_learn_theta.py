@@ -214,7 +214,7 @@ class Permute():
 
 class VI_SSM():
 
-    def __init__(self, obs, obs_bin, time_till, x0_mean, x0_std, theta_dist, fix_theta, sparse, priors, dt, T, p_val, kernel_len, batch_dims, network_dims, target_dims, no_flows, feat_window, learn_rate = 1e-3, pre_train=True):
+    def __init__(self, obs, obs_bin, time_till, x0_mean, x0_std, theta_dist, fix_theta, sparse, prior_mean, prior_sigma, dt, T, p_val, kernel_len, batch_dims, network_dims, target_dims, no_flows, feat_window, learn_rate = 1e-3, pre_train=True):
         # raw inputs -> class variables
         self.obs = obs #(2, 1024*151)
         self.obs_bin = obs_bin
@@ -226,12 +226,13 @@ class VI_SSM():
         self.sparse_str = self.sparse_str if self.fix_theta else ''
         self.theta_dist = theta_dist
         if self.fix_theta:
-            self.theta = tf.convert_to_tensor(np.tile(np.array(priors), [p_val, 1]), DTYPE) # (p, 4)
+            self.theta = tf.convert_to_tensor(np.tile(np.array(prior_mean), [p_val, 1]), DTYPE) # (p, 4)
             self.theta_log_prob = tf.constant(0.0, dtype=DTYPE)
         else:    
             self.theta = theta_dist.sample(p_val)
             self.theta_log_prob = theta_dist.log_prob(self.theta) # log q(theta)
-        self.priors = priors
+        self.prior_mean = [tf.cast(item, DTYPE) for item in prior_mean]
+        self.prior_sigma = [tf.cast(item, DTYPE) for item in prior_sigma]
         self.dt = dt
         self.p_val = p_val
         self.kernel_len = kernel_len
@@ -338,7 +339,7 @@ class VI_SSM():
     def _theta_strech(self):
         #used batch_dims-1 instead of batch_dims to exclude x0
         slice_stash = []
-        for i in range(len(self.priors)):
+        for i in range(len(self.prior_mean)):
             slice_stash.append(tf.reshape(tf.tile(tf.expand_dims(
                 (self.theta[:, i]), 1), [1, self.batch_dims-1]), [-1])) 
         return slice_stash
@@ -416,18 +417,20 @@ class VI_SSM():
         if self.fix_theta:
             prior_log_prob = tf.constant(0.0, dtype=DTYPE)
         else:
-            prior_mean = [tf.cast(item[0], DTYPE) for item in self.priors]
-            prior_scale = [tf.cast(item[1], DTYPE) for item in self.priors]
             # log p(theta)
-            prior_log_prob = tfd.MultivariateNormalDiag(
-                loc=prior_mean, scale_diag=prior_scale).log_prob(self.theta)
+            prior_dist = tfd.TransformedDistribution(
+                distribution=tfd.MultivariateNormalDiag(
+                    loc=self.prior_mean, 
+                    scale_diag=self.prior_sigma), 
+                bijector=tfb.Softplus(event_ndims=2))
+            self.prior_log_prob = prior_dist.log_prob(self.theta)
 
         ELBO = tf.cast(self.target_dims / self.batch_dims, DTYPE) * (
             SDE_log_prob - self.lf_log_prob + obs_log_prob
-            ) + prior_log_prob - self.theta_log_prob #all have dimension (p,)
+            ) + self.prior_log_prob - self.theta_log_prob #all have dimension (p,)
 
         # ELBO = (self.target_dims / self.batch_dims) * (SDE_log_prob - self.lf_log_prob) + prior_log_prob - self.theta_log_prob
-        return ELBO, SDE_log_prob, obs_log_prob, prior_log_prob
+        return ELBO, SDE_log_prob, obs_log_prob, self.prior_log_prob
 
     def build_flow(self):
         flows = []
@@ -482,12 +485,16 @@ class VI_SSM():
             tf.summary.scalar(
                 'SDE_log_prob p(x)', (self.target_dims / self.batch_dims) * tf.reduce_mean(self.sde_loss))
             if not self.fix_theta:
-                tf.summary.scalar('theta_log_prob p(theta)', tf.reduce_mean(self.theta_log_prob))
+                tf.summary.scalar('prior_log_prob p(theta)', tf.reduce_mean(self.prior_log_prob))
+                tf.summary.scalar('theta_log_prob q(theta)', tf.reduce_mean(self.theta_log_prob))
                 tf.summary.scalar('truth_log_prob q(theta*)', -self.theta_dist.log_prob([[0.31326169, 0.00247569, 0.31326169]])[0])
             tf.summary.scalar(
                 'obs_log_prob p(y|x)', (self.target_dims / self.batch_dims) * tf.reduce_mean(self.obs_loss))
             tf.summary.scalar(
                 'path_log_prob q(x)', (self.target_dims / self.batch_dims) * tf.reduce_mean(self.lf_log_prob))
+            # tf.summary.scalar(
+            #     'prior_log_prob p(theta)', tf.reduce_mean(self.prior_log_prob))
+
             # theta summaries
             for i in range(len(theta_pos_index)):
                 if theta_pos_index[i]:
@@ -496,7 +503,11 @@ class VI_SSM():
                 else:
                     tf.summary.histogram(
                         str(i), self.theta[:, i], family='parameters')
-            
+        if not self.fix_theta:
+            with tf.name_scope('theta'):
+                for i in range(len(theta_pos_index)):
+                    tf.summary.scalar(tf.reduce_mean(self.theta, axis=0)[i], name=f'theta_{i}_mean')
+        
         with tf.name_scope('theta_update'):
             tf.summary.scalar('min chol 00', tf.reduce_min(self.sde_chol[:,0,0]))
             tf.summary.scalar('min chol 11', tf.reduce_min(self.sde_chol[:,1,1]))
@@ -572,6 +583,13 @@ class VI_SSM():
                         )
 
                     else:
+                        # theta_vals = sess.run(self.theta)
+                        # print("Theta values:", theta_vals)
+                        # theta_log_prob = sess.run(self.theta_log_prob)
+                        # print("Theta log prob:", theta_log_prob)
+                        # prior_log_prob = sess.run(self.prior_log_prob)
+                        # print("Prior log prob:", prior_log_prob)
+                        
                         (_, summary, batch_loss) = sess.run(
                             [self.train_step, self.merged, self.mean_loss], feed_dict={
                                 self.time_feats: time_feats_feed,
@@ -661,90 +679,95 @@ class VI_SSM():
 
 
 ########### setting up the model ###########
-# hyperparams
-#theta prior 
 ### Init theta and theta* priors: divided by 10?
 def softplus_np_(x):
     return np.log(1 + np.exp(x))
-priors = softplus_np_([-1.0, -6.0, -1.0])
+prior_mean = softplus_np_([-1.0, -6.0, -1.0])
+prior_sigma = [np.sqrt(0.1)] * len(prior_mean)
+print('Prior mean:', prior_mean)
+print('Prior sigma:', prior_sigma)
 
-# theta dist
-bijectors = []
-num_bijectors = 4
-for i in range(num_bijectors):
-    bijectors.append(tfb.Invert(tfb.MaskedAutoregressiveFlow(
-        shift_and_log_scale_fn=tfb.masked_autoregressive_default_template(
-            hidden_layers=[5, 5, 5], activation=tf.nn.elu, dtype=tf.float64))))
-    if i < (num_bijectors - 1):
-        bijectors.append(tfb.Permute(
-            permutation=tf.cast(np.random.permutation(np.arange(0, len(priors))), DTYPE_INT)))
-flow_bijector = tfb.Chain(list(reversed(bijectors)))
+p_val = 128 #3  #number of random batches to be picked from time series
+kernel_len = 20
+dt = 0.2
+T = 30
+# target_dims = np.int32(T / dt) + 1
+target_dims = 151 #TODO:Useless, remove
+batch_dims = 151 #length M of time series for partitioning the data
+network_dims = [50] * 5
+no_flows = 3 # number of flow layers
+num_epochs = 1010
+pre_train_epochs = 500
+feat_window = 10 #l' obs window size
+print('\n'*3)
+# obs and theta
+x0_mean = np.array([91., 99.], dtype=NP_DTYPE)
+x0_std = np.array([1., 1.], dtype=NP_DTYPE)
 
-theta_dist = tfd.TransformedDistribution(
-    distribution=tfd.Normal(loc=tf.constant(0.0, dtype=DTYPE), scale=tf.constant(1.0, dtype=DTYPE)),
-    bijector=flow_bijector,
-    event_shape=[len(priors)])
-# theta_dist = tfd.MultivariateNormalDiag(loc = [tf.Variable(0.05), tf.Variable(.05), tf.Variable(0.05)], scale_diag= [tf.Variable(1.), tf.Variable(1.), tf.Variable(1.)])
+f1 = open('./dat/scratch/LV_obs_partial_theta_test.txt', 'r')
+f2 = open('./dat/scratch/LV_obs_binary_theta_test.txt', 'r')
+f3 = open('./dat/scratch/LV_time_till_theta_test.txt', 'r')
 
+# (2, 151*1024)
+obs = np.loadtxt(f1, NP_DTYPE)
+obs_not_observed = np.log(1 + np.exp(-2)) + 1.0 #f(x) = 1 + softplus(x-1) for obs=-1
+obs[obs==-1] = obs_not_observed
+obs_bin = np.loadtxt(f2, NP_DTYPE)
+time_till = np.loadtxt(f3, NP_DTYPE)
+f1.close()
+f2.close()
+f3.close()
+print('Data loaded')
+
+fix_theta = False if 'theta' in f1.name else True
+sparse = True if 'sparse' in f1.name else False
+sparse_str = 'sparse' if sparse else 'dense'
+sparse_str = sparse_str if fix_theta else ''
+theta_str = 'fix_theta' if fix_theta else 'learn_theta'
+
+out_dir = f'./out/{time.strftime("%Y%m%d-%H%M%S")}_{sparse_str}_{theta_str}'
+os.makedirs(out_dir, exist_ok=True)
 
 try:
+    # hyperparams
     tf.reset_default_graph()
-    p_val = 128 #3  #number of random batches to be picked from time series
-    kernel_len = 20
-    dt = 0.2
-    T = 30
-    # target_dims = np.int32(T / dt) + 1
-    target_dims = 151 #TODO:Useless, remove
-    batch_dims = 151 #length M of time series for partitioning the data
-    network_dims = [50] * 5
-    no_flows = 3 # number of flow layers
-    num_epochs = 2
-    pre_train_epochs = 1
-    feat_window = 10 #l' obs window size
-    print('\n'*3)
-    # obs and theta
-    x0_mean = np.array([91., 99.], dtype=NP_DTYPE)
-    x0_std = np.array([1., 1.], dtype=NP_DTYPE)
-    
-    f1 = open('./dat/scratch/LV_obs_partial_theta_test.txt', 'r')
-    f2 = open('./dat/scratch/LV_obs_binary_theta_test.txt', 'r')
-    f3 = open('./dat/scratch/LV_time_till_theta_test.txt', 'r')
 
-    # (2, 151*1024)
-    obs = np.loadtxt(f1, NP_DTYPE)
-    obs_not_observed = np.log(1 + np.exp(-2)) + 1.0 #f(x) = 1 + softplus(x-1) for obs=-1
-    obs[obs==-1] = obs_not_observed
-    obs_bin = np.loadtxt(f2, NP_DTYPE)
-    time_till = np.loadtxt(f3, NP_DTYPE)
-    f1.close()
-    f2.close()
-    f3.close()
-    print('Data loaded')
-    
-    fix_theta = False if 'theta' in f1.name else True
-    sparse = True if 'sparse' in f1.name else False
-    sparse_str = 'sparse' if sparse else 'dense'
-    sparse_str = sparse_str if fix_theta else ''
-    theta_str = 'fix_theta' if fix_theta else 'learn_theta'
+    #theta prior 
+    # theta dist
+    bijectors = []
+    num_bijectors = 4
+    for i in range(num_bijectors):
+        bijectors.append(tfb.Invert(tfb.MaskedAutoregressiveFlow(
+            shift_and_log_scale_fn=tfb.masked_autoregressive_default_template(
+                hidden_layers=[5, 5, 5], activation=tf.nn.elu))))
+        if i < (num_bijectors - 1):
+            bijectors.append(tfb.Permute(
+                permutation=tf.cast(np.random.permutation(np.arange(0, len(prior_mean))), DTYPE_INT)))
+    bijectors.append(tfb.Softplus(event_ndims=2))
+    flow_bijector = tfb.Chain(list(reversed(bijectors)))
+
+    theta_dist = tfd.TransformedDistribution(
+        distribution=tfd.Normal(loc=tf.constant(0.0, dtype=DTYPE), scale=tf.constant(1.0, dtype=DTYPE)),
+        bijector=flow_bijector,
+        event_shape=[len(prior_mean)])
+    # theta_dist = tfd.MultivariateNormalDiag(loc = [tf.Variable(0.05), tf.Variable(.05), tf.Variable(0.05)], scale_diag= [tf.Variable(1.), tf.Variable(1.), tf.Variable(1.)])
     
     # buiding the model
     var_model = VI_SSM(obs, obs_bin, time_till, x0_mean, x0_std, 
-                       theta_dist, fix_theta, sparse, priors, 
+                       theta_dist, fix_theta, sparse, prior_mean, prior_sigma,
                        dt, T, p_val,kernel_len, 
                        batch_dims, network_dims, target_dims, 
                        no_flows, feat_window, 
                        learn_rate = 1e-3, pre_train=True)
     var_model.build_flow()
     print('Model built')
-    out_dir = f'./out/{time.strftime("%Y%m%d-%H%M%S")}_{sparse_str}_{theta_str}'
-    os.makedirs(out_dir, exist_ok=True)
     # new session
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
         var_model.save_paths(f'{out_dir}/lf_sample.txt', sess)
         print('Paths saved')
         print('Training...')
-        # np.savetxt('/home/b2028663/scripts/arf/locally_variant/local_post.txt', sess.run(theta_dist.sample([100000])))
+        np.savetxt(f'{out_dir}/q_theta.txt', sess.run(theta_dist.sample([100000])))
         var_model.train(tensorboard_path=f'{out_dir}/train',
                         save_path=f'{out_dir}/LV_model.ckpt', sess=sess,
                         num_epochs=num_epochs, pre_train_epochs=pre_train_epochs)
