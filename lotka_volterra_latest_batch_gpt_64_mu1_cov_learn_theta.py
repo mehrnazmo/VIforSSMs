@@ -49,9 +49,16 @@ class Bivariate_Normal():
 
     def __init__(self, mu, chol):
         self.mu = tf.expand_dims(mu, 2)
-        # self.chol = chol + tf.expand_dims(tf.eye(2, dtype=DTYPE) * 1e-2, 0) # (p*(T-1), 2, 2)
-        self.chol = chol
-        cov_matrix = self.chol @ tf.transpose(self.chol, [0, 2, 1])
+        eye_mat = tf.tile(tf.expand_dims(tf.eye(2, dtype=DTYPE), 0), [chol.shape[0],1,1])
+        self.chol = chol + eye_mat * 1e-3 # (p*(T-1), 2, 2)
+        # self.chol = chol
+        chol_inv = tf.linalg.triangular_solve(self.chol, eye_mat, lower=True)
+        
+        self.cov_inv = tf.matmul(tf.transpose(chol_inv, perm=[0, 2, 1]), chol_inv)
+        self.det = tf.reduce_prod(tf.matrix_diag_part(chol), axis=1) ** 2
+        
+        # cov_matrix = self.chol @ tf.transpose(self.chol, [0, 2, 1])
+        self.eye_out = tf.matmul(self.chol @ tf.transpose(self.chol, [0, 2, 1]), self.cov_inv)
         # eps = 1e-5
         # cov_matrix = cov_matrix + tf.expand_dims(tf.eye(2, dtype=DTYPE) * eps, 0)
         # # self.cov_inv = tf.linalg.inv(cov_matrix)
@@ -60,25 +67,25 @@ class Bivariate_Normal():
         # self.cov_inv = tf.matmul(v, tf.matmul(tf.linalg.diag(s_inv), tf.transpose(u, perm=[0, 2, 1])))
         # self.det = tf.reduce_prod(tf.matrix_diag_part(self.chol)**2 + eps, axis=1)
 
-        def compute_pseudo_inverse(cov_matrix):
+        # def compute_pseudo_inverse(cov_matrix):
             
-            s, u, v = tf.linalg.svd(cov_matrix)
+        #     s, u, v = tf.linalg.svd(cov_matrix)
             
-            eps = 1e-5
+        #     eps = 1e-5
             
-            method1 = False
-            if method1:
-                s_inv = tf.where(s > 1e-3, 1.0 / s, tf.zeros_like(s)-1.0)
-                cov_inv = tf.matmul(v, tf.matmul(tf.linalg.diag(s_inv), tf.transpose(u, perm=[0, 2, 1])))
+        #     method1 = False
+        #     if method1:
+        #         s_inv = tf.where(s > 1e-3, 1.0 / s, tf.zeros_like(s)-1.0)
+        #         cov_inv = tf.matmul(v, tf.matmul(tf.linalg.diag(s_inv), tf.transpose(u, perm=[0, 2, 1])))
             
-            if not(method1):
-                s_update = s + eps * tf.ones((1,2), dtype=DTYPE)
-                s_inv = 1.0 / s_update
-                cov_inv = tf.matmul(v, tf.matmul(tf.linalg.diag(s_inv), tf.transpose(u, perm=[0, 2, 1])))
-                det = tf.reduce_prod(s_update, axis=1)
-            return cov_inv, s_inv, det   
+        #     if not(method1):
+        #         s_update = s + eps * tf.ones((1,2), dtype=DTYPE)
+        #         s_inv = 1.0 / s_update
+        #         cov_inv = tf.matmul(v, tf.matmul(tf.linalg.diag(s_inv), tf.transpose(u, perm=[0, 2, 1])))
+        #         det = tf.reduce_prod(s_update, axis=1)
+        #     return cov_inv, s_inv, det   
              
-        self.cov_inv, s_inv, self.det = compute_pseudo_inverse(cov_matrix)
+        # self.cov_inv, s_inv, self.det = compute_pseudo_inverse(cov_matrix)
         
         # determinant_min = tf.reduce_min(tf.abs(self.det))
         # self.cov_inv = tf.cond(
@@ -94,17 +101,18 @@ class Bivariate_Normal():
                              @ self.cov_inv @ (x - self.mu))
                 - np.log(2 * np.pi))
         
-    def log_prob(self, x, bijector_chain=None):
+    def log_prob(self, x, x_inverse, bijector_chain=None):
         '''
         log prob of bivariate normal dist with bijector chain
         '''
         if bijector_chain is None:
             return self.normal_log_prob(tf.expand_dims(x, 2))      
         else:
-            y = bijector_chain.inverse(x)
-            log_prob = self.normal_log_prob(tf.expand_dims(y, 2))
-            log_det_jacobian = bijector_chain.inverse_log_det_jacobian(x)
-            return log_prob + log_det_jacobian
+            # self.y = bijector_chain.inverse(x)
+            self.y = x_inverse
+            self.log_prob = self.normal_log_prob(tf.expand_dims(self.y, 2))
+            self.log_det_jacobian = bijector_chain.inverse_log_det_jacobian(x)
+            return self.log_prob + self.log_det_jacobian
 
 
 class IAF():
@@ -350,7 +358,7 @@ class VI_SSM():
         self.y_scale = (0.2 * self.lf_sample[:, :, 1:]) # (p, 2, T+1)
         y_dist = self.transform_dist(tfd.Normal(loc=self.y_loc, scale=self.y_scale))
         y_prob = y_dist.log_prob(self.obs_eval)
-        obs_log_prob = tf.reduce_sum(tf.reshape((y_prob * self.bin_feed), [self.p_val, -1]), 1)
+        self.obs_log_prob = tf.reduce_sum(tf.reshape((y_prob * self.bin_feed), [self.p_val, -1]), 1)
 
         def alpha(x1, x2, theta):
             drift_vec = tf.concat([tf.reshape(theta[0] * x1 - theta[1] * x1 * x2, [-1, 1]),
@@ -386,14 +394,15 @@ class VI_SSM():
             self.theta_eval) ##theta_eval: 4 * (p*(T-1),)   # (p*(T-1), 2, 2)
         
         # tf.Print(self.sde_chol, [self.sde_chol], message="Cholesky: \n")
-        bvn = Bivariate_Normal(mu=self.sde_mu, chol=self.sde_chol)
-        self.bvn_det = bvn.det
+        self.bvn = Bivariate_Normal(mu=self.sde_mu, chol=self.sde_chol)
 
         SDE_log_prob = tf.reduce_sum(tf.reshape(
-            bvn.log_prob(
+            self.bvn.log_prob(
                 lf_sample_flat, 
-                bijector_chain=
-                tfb.Chain([
+                tf.concat([tf.reshape(self.lf_sample_neg[:, 0, 2:], [-1, 1]),
+                           tf.reshape(self.lf_sample_neg[:, 1, 2:], [-1, 1])], 1) 
+                + tf.constant(1.0, dtype=DTYPE),
+                bijector_chain = tfb.Chain([
                     tfb.Affine(shift=self.shift_plus, scale_diag=self.scale_diag),  
                     tfb.Softplus(event_ndims=2),                      
                     tfb.Affine(shift=self.shift_minus, scale_diag=self.scale_diag)])
@@ -409,7 +418,9 @@ class VI_SSM():
             tfb.Affine(shift=self.shift_minus, scale_diag=self.scale_diag)    
                 ])
         x0_dist_init = tfd.MultivariateNormalDiag(loc=self.x0_mean, scale_diag=self.x0_std)
-        x0_dist = tfd.TransformedDistribution(distribution=x0_dist_init, bijector=x0_transforms)
+        x0_dist = tfd.TransformedDistribution(distribution=x0_dist_init, bijector=
+                                            #   tfb.Softplus(event_ndims=2))
+                                              x0_transforms)
         self.x0_log_prob = x0_dist.log_prob(x0_sample)
         SDE_log_prob += self.x0_log_prob
         
@@ -426,11 +437,11 @@ class VI_SSM():
             self.prior_log_prob = prior_dist.log_prob(self.theta)
 
         ELBO = tf.cast(self.target_dims / self.batch_dims, DTYPE) * (
-            SDE_log_prob - self.lf_log_prob + obs_log_prob
+            SDE_log_prob - self.lf_log_prob + self.obs_log_prob
             ) + self.prior_log_prob - self.theta_log_prob #all have dimension (p,)
 
         # ELBO = (self.target_dims / self.batch_dims) * (SDE_log_prob - self.lf_log_prob) + prior_log_prob - self.theta_log_prob
-        return ELBO, SDE_log_prob, obs_log_prob, self.prior_log_prob
+        return ELBO, SDE_log_prob, self.obs_log_prob, self.prior_log_prob
 
     def build_flow(self):
         flows = []
@@ -448,13 +459,14 @@ class VI_SSM():
         #lf_sample_init: x samples output of q(x|theta) with IAF (p_val, 102)
         # lf_sample_neg: (p_val, (u,v)=2, M+1=51)
         #lf_log_prob_init: log q(x) (p,)
-        lf_sample_init, lf_log_prob_init = self.SSM.slp() #slp: sample, log probability
+        lf_sample_init, self.lf_log_prob_init = self.SSM.slp() #slp: sample, log probability
         self.lf_sample_neg = tf.transpose(tf.reshape(lf_sample_init, [self.p_val, -1, 2]), [0, 2, 1]) #lf_sample_neg: (p,2,T+1)
         # transform
         qx_transform = tfb.Chain([
             tfb.Affine(shift=self.shift_plus, scale_diag=self.scale_diag),  
-            tfb.Softplus(event_ndims=2)                  
-        ])
+            tfb.Softplus(event_ndims=2)
+            # tfb.Affine(shift=self.shift_minus, scale_diag=self.scale_diag)
+            ])
 
         def trp(x):
             return tf.transpose(x, [0, 2, 1])
@@ -463,10 +475,9 @@ class VI_SSM():
         #  [v0, softplus(v1_q), ..., softplus(vM_q)]]
         lf_sample_neg = trp(self.lf_sample_neg) # (p, T+1, 2)
         #modifying log q(x) to accomodate softplus
-        self.lf_sample = trp(qx_transform.forward(lf_sample_neg)) * self.mask + self.shift # (p, 2, T+1)
-        
-        self.lf_log_prob = lf_log_prob_init + qx_transform.inverse_log_det_jacobian(
-            trp(self.lf_sample[:, :, 1:])) #log q(x) from normalizing flow # (p,)       
+        self.lf_sample = trp(qx_transform.forward(lf_sample_neg)) * self.mask + self.shift + 1e-6 # (p, 2, T+1)
+        self.qx_jacob = qx_transform.inverse_log_det_jacobian(trp(self.lf_sample[:, :, 1:]))
+        self.lf_log_prob = self.lf_log_prob_init + self.qx_jacob #log q(x) from normalizing flow # (p,)       
         _loss, self.sde_loss, self.obs_loss, prior_prob = self._ELBO()
         loss = tf.where(tf.is_nan(_loss), tf.zeros_like(_loss), _loss)
         self.mean_loss = tf.reduce_mean(loss)
@@ -494,6 +505,8 @@ class VI_SSM():
                 'path_log_prob q(x)', (self.target_dims / self.batch_dims) * tf.reduce_mean(self.lf_log_prob))
             # tf.summary.scalar(
             #     'prior_log_prob p(theta)', tf.reduce_mean(self.prior_log_prob))
+            tf.summary.scalar('x0_log_prob p(x0)', tf.reduce_mean(self.x0_log_prob))
+            tf.summary.scalar('sde loss without x0', tf.reduce_mean(self.sde_loss))
 
             # theta summaries
             for i in range(len(theta_pos_index)):
@@ -506,7 +519,35 @@ class VI_SSM():
         if not self.fix_theta:
             with tf.name_scope('theta'):
                 for i in range(len(theta_pos_index)):
-                    tf.summary.scalar(tf.reduce_mean(self.theta, axis=0)[i], name=f'theta_{i}_mean')
+                    tf.summary.scalar(f'theta_{i}_mean', tf.reduce_mean(self.theta[i]))
+                    tf.summary.scalar(f'theta_{i}_min', tf.reduce_min(self.theta[i]))
+                    tf.summary.scalar(f'theta_{i}_max', tf.reduce_max(self.theta[i]))
+                    tf.summary.scalar(f'theta_{i}_nan', tf.reduce_sum(tf.cast(tf.is_nan(self.theta[i]), DTYPE_INT)))
+                    tf.summary.scalar(f'theta_{i}_inf', tf.reduce_sum(tf.cast(tf.is_inf(self.theta[i]), DTYPE_INT)))
+                    
+        with tf.name_scope('Nan_Inf'):
+            tf.summary.scalar('prior_log_prob p(theta) nan', tf.reduce_sum(tf.cast(tf.is_nan(self.prior_log_prob), DTYPE_INT)))
+            tf.summary.scalar('prior_log_prob p(theta) inf', tf.reduce_sum(tf.cast(tf.is_inf(self.prior_log_prob), DTYPE_INT)))
+            tf.summary.scalar('theta_log_prob q(theta) nan', tf.reduce_sum(tf.cast(tf.is_nan(self.theta_log_prob), DTYPE_INT)))
+            tf.summary.scalar('theta_log_prob q(theta) inf', tf.reduce_sum(tf.cast(tf.is_inf(self.theta_log_prob), DTYPE_INT)))
+            tf.summary.scalar('obs_log_prob p(y|x) nan', tf.reduce_sum(tf.cast(tf.is_nan(self.obs_log_prob), DTYPE_INT)))
+            tf.summary.scalar('obs_log_prob p(y|x) inf', tf.reduce_sum(tf.cast(tf.is_inf(self.obs_log_prob), DTYPE_INT)))
+            tf.summary.scalar('path_log_prob q(x) nan', tf.reduce_sum(tf.cast(tf.is_nan(self.lf_log_prob), DTYPE_INT)))
+            tf.summary.scalar('path_log_prob q(x) inf', tf.reduce_sum(tf.cast(tf.is_inf(self.lf_log_prob), DTYPE_INT)))
+            tf.summary.scalar('SDE_log_prob p(x) nan', tf.reduce_sum(tf.cast(tf.is_nan(self.sde_loss), DTYPE_INT)))
+            tf.summary.scalar('SDE_log_prob p(x) inf', tf.reduce_sum(tf.cast(tf.is_inf(self.sde_loss), DTYPE_INT)))
+            tf.summary.scalar('ELBO nan', tf.reduce_sum(tf.cast(tf.is_nan(loss), DTYPE_INT)))
+            tf.summary.scalar('ELBO inf', tf.reduce_sum(tf.cast(tf.is_inf(loss), DTYPE_INT)))
+            tf.summary.scalar('mean loss nan', tf.reduce_sum(tf.cast(tf.is_nan(self.mean_loss), DTYPE_INT)))
+            tf.summary.scalar('mean loss inf', tf.reduce_sum(tf.cast(tf.is_inf(self.mean_loss), DTYPE_INT)))
+            tf.summary.scalar('lf_sample nan', tf.reduce_sum(tf.cast(tf.is_nan(self.lf_sample), DTYPE_INT)))
+            tf.summary.scalar('lf_sample inf', tf.reduce_sum(tf.cast(tf.is_inf(self.lf_sample), DTYPE_INT)))       
+            tf.summary.scalar('bvn y nan', tf.reduce_sum(tf.cast(tf.is_nan(self.bvn.y), DTYPE_INT)))
+            tf.summary.scalar('bvn y inf', tf.reduce_sum(tf.cast(tf.is_inf(self.bvn.y), DTYPE_INT)))
+            tf.summary.scalar('bvn log_prob nan', tf.reduce_sum(tf.cast(tf.is_nan(self.bvn.log_prob), DTYPE_INT)))
+            tf.summary.scalar('bvn log_prob inf', tf.reduce_sum(tf.cast(tf.is_inf(self.bvn.log_prob), DTYPE_INT)))
+            tf.summary.scalar('bvn log_det_jacobian nan', tf.reduce_sum(tf.cast(tf.is_nan(self.bvn.log_det_jacobian), DTYPE_INT)))
+            tf.summary.scalar('bvn log_det_jacobian inf', tf.reduce_sum(tf.cast(tf.is_inf(self.bvn.log_det_jacobian), DTYPE_INT)))
         
         with tf.name_scope('theta_update'):
             tf.summary.scalar('min chol 00', tf.reduce_min(self.sde_chol[:,0,0]))
@@ -521,10 +562,24 @@ class VI_SSM():
             tf.summary.scalar('max chol 11', tf.reduce_max(self.sde_chol[:,1,1]))
             tf.summary.scalar('max chol 10', tf.reduce_max(self.sde_chol[:,1,0]))   
             
-            tf.summary.scalar('min cov det', tf.reduce_min(self.bvn_det))
-            tf.summary.scalar('min abs cov det', tf.reduce_min(tf.abs(self.bvn_det)))
-            tf.summary.scalar('mean cov det', tf.reduce_mean(self.bvn_det))
+            tf.summary.scalar('min cov det', tf.reduce_min(self.bvn.det))
+            tf.summary.scalar('min abs cov det', tf.reduce_min(tf.abs(self.bvn.det)))
+            tf.summary.scalar('mean cov det', tf.reduce_mean(self.bvn.det))
             
+        with tf.name_scope('sample'):
+            tf.summary.scalar('min lf sample', tf.reduce_min(self.lf_sample))
+            tf.summary.scalar('max lf sample', tf.reduce_max(self.lf_sample))
+            tf.summary.scalar('mean lf sample', tf.reduce_mean(self.lf_sample))
+            
+            tf.summary.scalar('min bvn y', tf.reduce_min(self.bvn.y))
+            tf.summary.scalar('max bvn y', tf.reduce_max(self.bvn.y))
+            tf.summary.scalar('mean bvn y', tf.reduce_mean(self.bvn.y))
+            
+            tf.summary.scalar('min bvn log prob', tf.reduce_min(self.bvn.log_prob))
+            tf.summary.scalar('max bvn log prob', tf.reduce_max(self.bvn.log_prob))
+            tf.summary.scalar('mean bvn log prob', tf.reduce_mean(self.bvn.log_prob))
+
+            tf.summary.scalar('bvn log det jacobian', (self.bvn.log_det_jacobian))            
 
         with tf.name_scope('optimize'):
             opt = AdamaxOptimizer(learning_rate=self.learn_rate, beta1=0.95)
@@ -536,6 +591,10 @@ class VI_SSM():
                 zip(self.gradients, variables))
             tf.summary.scalar(
                 'global_norm', global_norm)
+            
+        with tf.name_scope('gradient'):
+            for ggi, gg in enumerate(self.gradients):
+                tf.summary.scalar(f'gradient_{ggi}', tf.reduce_mean(gg))
 
         self.merged = tf.summary.merge_all()
         self.loss = loss
@@ -560,8 +619,8 @@ class VI_SSM():
                 print("Finished pre-training...")
                 run = 0
                 
+            batch_num = 0
             while True:
-                batch_num = 0
                 try:
                     batch = sess.run(next_batch)  # Fetch batch from dataset
                     feat1, feat2, feat3, feat4, mask_feed, shift_feed, bin_feed = batch
@@ -581,17 +640,30 @@ class VI_SSM():
                                 self.diffusivity: [0.0]
                             }
                         )
+                        batch_num += 1
 
                     else:
+                        # print('\n'*3)
+                        # print('Batch number:', self.batches_in_epoch*run+batch_num)
                         # theta_vals = sess.run(self.theta)
                         # print("Theta values:", theta_vals)
                         # theta_log_prob = sess.run(self.theta_log_prob)
                         # print("Theta log prob:", theta_log_prob)
                         # prior_log_prob = sess.run(self.prior_log_prob)
                         # print("Prior log prob:", prior_log_prob)
-                        
-                        (_, summary, batch_loss) = sess.run(
-                            [self.train_step, self.merged, self.mean_loss], feed_dict={
+                        # print("Training...")
+                        # (lf_log_prob_init, qx_jacob, bvn_y, bvn_log_prob, bvn_log_det_jacobian, 
+                        #  lf_sample, lf_log_prob, obs_log_prob,
+                        #  bvn_eye, x0_log_prob, sde_loss, gradients, 
+                        (train_step, summary, batch_loss) = sess.run(
+                            #  [self.lf_log_prob_init, self.qx_jacob,
+                            #   self.bvn.y, self.bvn.log_prob, 
+                            #   self.bvn.log_det_jacobian, 
+                            #   self.lf_sample, self.lf_log_prob, self.obs_log_prob,
+                            #     self.bvn.eye_out, self.x0_log_prob, self.sde_loss, 
+                            #     self.gradients, 
+                                [self.train_step, self.merged, 
+                                self.mean_loss], feed_dict={
                                 self.time_feats: time_feats_feed,
                                 self.mask: mask_feed,
                                 self.shift: shift_feed,
@@ -599,9 +671,35 @@ class VI_SSM():
                                 self.diffusivity: [0.0]
                             }
                         )
+                        # print("Bivariate normal eye:", bvn_eye)
+                        # print("Bivariate normal x:", 
+                        #       np.concatenate((np.reshape(lf_sample[:, 0, 2:], [-1, 1]),
+                        #                       np.reshape(lf_sample[:, 1, 2:], [-1, 1])), 1))
+                        # print('min x: ', np.min(lf_sample))
+                        # print('max x: ', np.max(lf_sample))
+                        # print('nan x', np.sum(np.isnan(lf_sample)))
+                        # print('inf x', np.sum(np.isinf(lf_sample)))
+                        # print("Bivariate normal y:", bvn_y)
+                        # print('min y: ', np.min(bvn_y))
+                        # print('max y: ', np.max(bvn_y))
+                        # print('nan y', np.sum(np.isnan(bvn_y)))
+                        # print('inf y', np.sum(np.isinf(bvn_y)))
+                        # print("Bivariate normal log prob:", bvn_log_prob)
+                        # print("Bivariate normal log det jacobian:", bvn_log_det_jacobian)
+                        # print("X0 log prob:", x0_log_prob)
+                        # print("SDE loss:", sde_loss)
+                        # print("q(x) lf_log_prob_init:", lf_log_prob_init)
+                        # print("q(x) jacobian:", qx_jacob)
+                        # print("q(x) log prob:", lf_log_prob)
+                        # print("p(y|x) log prob:", obs_log_prob)
+                        # print("Train step:", train_step)
+                        # for gg in gradients:
+                        #     print("Gradient:", np.mean(gg))
+                        # # print("Gradients:", gradients)
                         
                         epoch_loss.append(batch_loss)
                         writer.add_summary(summary, self.batches_in_epoch*run+batch_num)
+                        batch_num += 1
   
                     elapsed_time = time.time() - start_time
                     elapsed_time_summary = tf.Summary(
@@ -611,7 +709,6 @@ class VI_SSM():
                 except tf.errors.OutOfRangeError:
                     break  # Exit loop when dataset is exhausted
                 
-                batch_num += 1
 
             # epoch elbo
             if not self.pre_train:
@@ -710,7 +807,8 @@ f3 = open('./dat/scratch/LV_time_till_theta_test.txt', 'r')
 
 # (2, 151*1024)
 obs = np.loadtxt(f1, NP_DTYPE)
-obs_not_observed = np.log(1 + np.exp(-2)) + 1.0 #f(x) = 1 + softplus(x-1) for obs=-1
+# obs_not_observed = np.log(1 + np.exp(-2)) + 1.0 #f(x) = 1 + softplus(x-1) for obs=-1
+obs_not_observed = 2.0
 obs[obs==-1] = obs_not_observed
 obs_bin = np.loadtxt(f2, NP_DTYPE)
 time_till = np.loadtxt(f3, NP_DTYPE)
